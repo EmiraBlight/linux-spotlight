@@ -229,7 +229,7 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
         .application(app)
         .title("Linux Spotlight")
         .default_width(650)
-        .default_height(120) // starts small, expands
+        .resizable(false)
         .decorated(false)
         .build();
 
@@ -268,6 +268,21 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
 
     // Reactive data list store
     let list_store = gio::ListStore::new::<SearchResult>();
+
+    // Connect to items-changed signal to dynamically resize/shrink the window to fit the visible rows perfectly
+    let window_clone_size = window.clone();
+    let scrolled_window_clone = scrolled_window.clone();
+    list_store.connect_items_changed(move |store, _, _, _| {
+        let has_items = store.n_items() > 0;
+        scrolled_window_clone.set_visible(has_items);
+
+        let window_clone_size = window_clone_size.clone();
+        glib::idle_add_local_once(move || {
+            if window_clone_size.is_visible() {
+                window_clone_size.set_default_size(650, -1);
+            }
+        });
+    });
 
     // Single selection model
     let selection_model = SingleSelection::new(Some(list_store.clone()));
@@ -338,8 +353,6 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
     let selection_model_clone = selection_model.clone();
     let list_store_clone = list_store.clone();
     let list_view_clone = list_view.clone();
-    let window_clone = window.clone();
-    let search_entry_clone = search_entry.clone();
 
     let entry_controller = gtk::EventControllerKey::new();
     entry_controller.connect_key_pressed(move |_, key, _, _| {
