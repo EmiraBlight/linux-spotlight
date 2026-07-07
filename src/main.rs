@@ -12,6 +12,9 @@ use gdk::Display;
 use std::rc::Rc;
 use std::cell::RefCell;
 
+use tracker::prelude::*;
+use tracker::SparqlConnection;
+
 // Custom GObject for holding search results
 mod imp {
     use gtk4 as gtk;
@@ -137,13 +140,23 @@ fn main() {
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
+    // Create the persistent Tracker SparqlConnection
+    let tracker_conn = match SparqlConnection::bus_new("org.freedesktop.Tracker3.Miner.Files", None, None) {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            eprintln!("Warning: Failed to connect to Tracker 3 Files Miner: {}", e);
+            None
+        }
+    };
+
     // Application state: holds references to the window and search entry
     let state: Rc<RefCell<Option<(ApplicationWindow, Entry)>>> = Rc::new(RefCell::new(None));
 
+    let tracker_conn_clone = tracker_conn.clone();
     let state_clone = state.clone();
     app.connect_activate(move |app| {
         if state_clone.borrow().is_none() {
-            let (window, search_entry) = build_ui(app);
+            let (window, search_entry) = build_ui(app, &tracker_conn_clone);
             *state_clone.borrow_mut() = Some((window, search_entry));
         }
     });
@@ -172,7 +185,7 @@ fn main() {
     app.run();
 }
 
-fn build_ui(app: &Application) -> (ApplicationWindow, Entry) {
+fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (ApplicationWindow, Entry) {
     // 1. Create Window
     let window = ApplicationWindow::builder()
         .application(app)
@@ -320,10 +333,123 @@ fn build_ui(app: &Application) -> (ApplicationWindow, Entry) {
     });
     window.add_controller(window_controller);
 
-    // Populate mock data
+    // Connect search entry changed signal for query and debouncing
+    let pending_search_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pending_search_clone = pending_search_id.clone();
+    let list_store_clone = list_store.clone();
+    let tracker_conn_clone = tracker_conn.clone();
+
+    search_entry.connect_changed(move |entry| {
+        if let Some(source_id) = pending_search_clone.borrow_mut().take() {
+            source_id.remove();
+        }
+
+        let text = entry.text().to_string();
+        if text.trim().is_empty() {
+            list_store_clone.remove_all();
+            return;
+        }
+
+        let pending_search_clone2 = pending_search_clone.clone();
+        let list_store_clone2 = list_store_clone.clone();
+        let tracker_conn_clone2 = tracker_conn_clone.clone();
+
+        let source_id = glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            pending_search_clone2.borrow_mut().take();
+            perform_search(&text, &list_store_clone2, &tracker_conn_clone2);
+        });
+
+        *pending_search_clone.borrow_mut() = Some(source_id);
+    });
+
+    // Populate mock initial instructions when first showing empty
     populate_mock_data(&list_store);
 
     (window, search_entry)
+}
+
+fn perform_search(query: &str, list_store: &gio::ListStore, tracker_conn: &Option<SparqlConnection>) {
+    let query_lower = query.to_lowercase();
+    let query_text = query.to_string();
+    let list_store_clone = list_store.clone();
+    let connection_opt = tracker_conn.clone();
+
+    // Spawn an async block on the main context
+    glib::MainContext::default().spawn_local(async move {
+        let mut results = Vec::new();
+
+        // 1. Search for Applications using GTK's native gio::AppInfo
+        // This is synchronous but extremely fast (reads from memory cache in glib).
+        let apps = gio::AppInfo::all();
+        let mut app_count = 0;
+        for app in apps {
+            let name = app.display_name().to_string();
+            let name_lower = name.to_lowercase();
+            
+            let desc = app.description().map(|d| d.to_string()).unwrap_or_default();
+            let desc_lower = desc.to_lowercase();
+            
+            let exec = app.executable().to_string_lossy().to_string();
+            let exec_lower = exec.to_lowercase();
+
+            if name_lower.contains(&query_lower) || desc_lower.contains(&query_lower) || exec_lower.contains(&query_lower) {
+                // Just use a fallback icon for now, since icon extraction from gio::Icon is complex in Rust
+                let icon_name = "application-x-executable".to_string();
+
+                results.push(SearchResult::new(&name, &format!("App: {}", exec), &icon_name));
+                app_count += 1;
+                if app_count >= 15 {
+                    break;
+                }
+            }
+        }
+
+        // 2. Search for Files using Tracker 3 (if available)
+        if let Some(connection) = connection_opt {
+            let escaped_query = query_text.replace('\'', "\\'");
+            let files_query = format!(
+                "SELECT ?name ?url WHERE {{ \
+                    ?file a nfo:FileDataObject ; \
+                          nie:url ?url ; \
+                          nfo:fileName ?name . \
+                    FILTER (contains(lcase(?name), lcase('{}'))) \
+                 }} LIMIT 15",
+                escaped_query
+            );
+
+            if let Ok(cursor) = connection.query_future(&files_query).await {
+                while let Ok(has_next) = cursor.next_future().await {
+                    if !has_next {
+                        break;
+                    }
+                    let name = cursor.string(0).map(|s| s.to_string()).unwrap_or_default();
+                    let url = cursor.string(1).map(|s| s.to_string()).unwrap_or_default();
+
+                    let friendly_path = if url.starts_with("file://") {
+                        url.replacen("file://", "", 1)
+                    } else {
+                        url
+                    };
+
+                    results.push(SearchResult::new(&name, &friendly_path, "text-x-generic"));
+                }
+            }
+        }
+
+        // 3. Fallback if nothing found
+        if results.is_empty() {
+            results.push(SearchResult::new(
+                "No results found",
+                &format!("No matches found for '{}'", query_text),
+                "dialog-information"
+            ));
+        }
+
+        list_store_clone.remove_all();
+        for item in results {
+            list_store_clone.append(&item);
+        }
+    });
 }
 
 fn populate_mock_data(list_store: &gio::ListStore) {
