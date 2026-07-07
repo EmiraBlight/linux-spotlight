@@ -4,7 +4,7 @@ use gtk::subclass::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box, Entry, Orientation, ListView, ScrolledWindow,
     CssProvider, style_context_add_provider_for_display, Label, PolicyType,
-    SignalListItemFactory, SingleSelection
+    SignalListItemFactory, SingleSelection, Image
 };
 use gtk::gio;
 use gtk::gdk;
@@ -18,6 +18,7 @@ use tracker::SparqlConnection;
 // Custom GObject for holding search results
 mod imp {
     use gtk4 as gtk;
+    use gtk::gio;
     use gtk::glib;
     use gtk::subclass::prelude::*;
     use std::cell::RefCell;
@@ -26,7 +27,9 @@ mod imp {
     pub struct SearchResult {
         pub title: RefCell<String>,
         pub subtitle: RefCell<String>,
-        pub icon: RefCell<String>,
+        pub icon_name: RefCell<String>,
+        pub app_info: RefCell<Option<gio::AppInfo>>,
+        pub file_uri: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -46,11 +49,29 @@ glib::wrapper! {
 }
 
 impl SearchResult {
-    pub fn new(title: &str, subtitle: &str, icon: &str) -> Self {
+    pub fn new_app(title: &str, subtitle: &str, icon_name: &str, app_info: &gio::AppInfo) -> Self {
         let obj: Self = glib::Object::builder().build();
         *obj.imp().title.borrow_mut() = title.to_string();
         *obj.imp().subtitle.borrow_mut() = subtitle.to_string();
-        *obj.imp().icon.borrow_mut() = icon.to_string();
+        *obj.imp().icon_name.borrow_mut() = icon_name.to_string();
+        *obj.imp().app_info.borrow_mut() = Some(app_info.clone());
+        obj
+    }
+
+    pub fn new_file(title: &str, subtitle: &str, icon_name: &str, file_uri: &str) -> Self {
+        let obj: Self = glib::Object::builder().build();
+        *obj.imp().title.borrow_mut() = title.to_string();
+        *obj.imp().subtitle.borrow_mut() = subtitle.to_string();
+        *obj.imp().icon_name.borrow_mut() = icon_name.to_string();
+        *obj.imp().file_uri.borrow_mut() = Some(file_uri.to_string());
+        obj
+    }
+
+    pub fn new_mock(title: &str, subtitle: &str, icon_name: &str) -> Self {
+        let obj: Self = glib::Object::builder().build();
+        *obj.imp().title.borrow_mut() = title.to_string();
+        *obj.imp().subtitle.borrow_mut() = subtitle.to_string();
+        *obj.imp().icon_name.borrow_mut() = icon_name.to_string();
         obj
     }
 
@@ -62,8 +83,8 @@ impl SearchResult {
         self.imp().subtitle.borrow().clone()
     }
 
-    pub fn icon(&self) -> String {
-        self.imp().icon.borrow().clone()
+    pub fn icon_name(&self) -> String {
+        self.imp().icon_name.borrow().clone()
     }
 }
 
@@ -97,26 +118,35 @@ window {
     background: rgba(255, 255, 255, 0.08);
 }
 
+/* Remove default focus outlines */
 listview {
     background: transparent;
     border: none;
+    outline: none;
 }
 
-/* List item row styling */
-listview  row {
-    padding: 8px 12px;
+listitem {
+    outline: none;
+    border: none;
+}
+
+row {
+    outline: none;
+    border: none;
+    padding: 10px 14px;
     border-radius: 8px;
     margin: 2px 0;
     color: #e0e0e0;
 }
 
-listview  row:hover {
+row:hover {
     background-color: rgba(255, 255, 255, 0.05);
 }
 
-listview  row:selected {
+row:selected {
     background-color: #3584e4;
     color: #ffffff;
+    outline: none;
 }
 
 .row-title {
@@ -129,8 +159,16 @@ listview  row:selected {
     color: #909090;
 }
 
-listview  row:selected .row-subtitle {
+row:selected .row-subtitle {
     color: #d0d0d0;
+}
+
+.row-icon {
+    opacity: 0.9;
+}
+
+row:selected .row-icon {
+    opacity: 1.0;
 }
 ";
 
@@ -238,9 +276,21 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
     let factory = SignalListItemFactory::new();
 
     factory.connect_setup(move |_, list_item| {
-        let row_box = Box::builder()
+        let row_container = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(12)
+            .build();
+
+        let icon_image = Image::builder()
+            .pixel_size(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build();
+        icon_image.add_css_class("row-icon");
+
+        let text_box = Box::builder()
             .orientation(Orientation::Vertical)
-            .spacing(2)
+            .spacing(1)
             .build();
 
         let title_label = Label::builder()
@@ -253,22 +303,28 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
             .build();
         subtitle_label.add_css_class("row-subtitle");
 
-        row_box.append(&title_label);
-        row_box.append(&subtitle_label);
+        text_box.append(&title_label);
+        text_box.append(&subtitle_label);
 
-        list_item.set_child(Some(&row_box));
+        row_container.append(&icon_image);
+        row_container.append(&text_box);
+
+        list_item.set_child(Some(&row_container));
     });
 
     factory.connect_bind(move |_, list_item| {
         let item = list_item.item().unwrap();
         let search_result = item.downcast_ref::<SearchResult>().unwrap();
 
-        let row_box = list_item.child().unwrap().downcast::<Box>().unwrap();
-        let title_label = row_box.first_child().unwrap().downcast::<Label>().unwrap();
+        let row_container = list_item.child().unwrap().downcast::<Box>().unwrap();
+        let icon_image = row_container.first_child().unwrap().downcast::<Image>().unwrap();
+        let text_box = icon_image.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let title_label = text_box.first_child().unwrap().downcast::<Label>().unwrap();
         let subtitle_label = title_label.next_sibling().unwrap().downcast::<Label>().unwrap();
 
         title_label.set_text(&search_result.title());
         subtitle_label.set_text(&search_result.subtitle());
+        icon_image.set_icon_name(Some(&search_result.icon_name()));
     });
 
     let list_view = ListView::new(Some(selection_model.clone()), Some(factory));
@@ -281,51 +337,85 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
     // 4. Connect keyboard navigation redirect on the search entry
     let selection_model_clone = selection_model.clone();
     let list_store_clone = list_store.clone();
+    let list_view_clone = list_view.clone();
+    let window_clone = window.clone();
+    let search_entry_clone = search_entry.clone();
+
     let entry_controller = gtk::EventControllerKey::new();
     entry_controller.connect_key_pressed(move |_, key, _, _| {
-        let current_selected = selection_model_clone.selected();
-        let total_items = list_store_clone.n_items();
-
         match key {
             gdk::Key::Down => {
-                if total_items > 0 {
-                    if current_selected == gtk::INVALID_LIST_POSITION {
-                        selection_model_clone.set_selected(0);
-                    } else if current_selected < total_items - 1 {
-                        selection_model_clone.set_selected(current_selected + 1);
-                    }
+                // Instantly transfer focus to the results list natively
+                if list_store_clone.n_items() > 0 {
+                    list_view_clone.grab_focus();
+                    selection_model_clone.set_selected(0);
                 }
                 gtk::glib::Propagation::Stop
-            }
-            gdk::Key::Up => {
-                if total_items > 0 {
-                    if current_selected != gtk::INVALID_LIST_POSITION && current_selected > 0 {
-                        selection_model_clone.set_selected(current_selected - 1);
-                    }
-                }
-                gtk::glib::Propagation::Stop
-            }
-            gdk::Key::Return => {
-                if current_selected != gtk::INVALID_LIST_POSITION {
-                    if let Some(item) = list_store_clone.item(current_selected) {
-                        if let Ok(search_result) = item.downcast::<SearchResult>() {
-                            println!("Activated item: {}", search_result.title());
-                        }
-                    }
-                }
-                gtk::glib::Propagation::Proceed
             }
             _ => gtk::glib::Propagation::Proceed
         }
     });
     search_entry.add_controller(entry_controller);
 
-    // 5. Connect keyboard/escape to hide the window instead of closing (exiting) the application
+    // 4.5 Connect Enter key directly to the search entry activation
+    let selection_model_clone3 = selection_model.clone();
+    let list_store_clone3 = list_store.clone();
+    let window_clone4 = window.clone();
+    let search_entry_clone4 = search_entry.clone();
+    search_entry.connect_activate(move |_| {
+        let current_selected = selection_model_clone3.selected();
+        let index_to_activate = if current_selected == gtk::INVALID_LIST_POSITION {
+            0
+        } else {
+            current_selected
+        };
+
+        if list_store_clone3.n_items() > index_to_activate {
+            if let Some(item) = list_store_clone3.item(index_to_activate) {
+                if let Ok(search_result) = item.downcast::<SearchResult>() {
+                    execute_action(&search_result, &window_clone4, &search_entry_clone4);
+                }
+            }
+        }
+    });
+
+    // 5. Connect keyboard navigation on the ListView itself
+    let search_entry_clone2 = search_entry.clone();
+    let selection_model_clone2 = selection_model.clone();
+    let list_view_controller = gtk::EventControllerKey::new();
+    list_view_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Up {
+            let selected = selection_model_clone2.selected();
+            if selected == 0 || selected == gtk::INVALID_LIST_POSITION {
+                // Focus back to search entry smoothly
+                search_entry_clone2.grab_focus();
+                let len = search_entry_clone2.text_length();
+                search_entry_clone2.set_position(len as i32);
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    list_view.add_controller(list_view_controller);
+
+    // 6. Connect ListView activation (Enter / Click)
+    let list_store_clone2 = list_store.clone();
+    let window_clone2 = window.clone();
+    let search_entry_clone3 = search_entry.clone();
+    list_view.connect_activate(move |_, position| {
+        if let Some(item) = list_store_clone2.item(position) {
+            if let Ok(search_result) = item.downcast::<SearchResult>() {
+                execute_action(&search_result, &window_clone2, &search_entry_clone3);
+            }
+        }
+    });
+
+    // 7. Connect keyboard/escape to hide the window instead of closing (exiting) the application
     let window_controller = gtk::EventControllerKey::new();
-    let window_clone = window.clone();
+    let window_clone3 = window.clone();
     window_controller.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
-            window_clone.hide();
+            window_clone3.hide();
             gtk::glib::Propagation::Stop
         } else {
             gtk::glib::Propagation::Proceed
@@ -336,7 +426,7 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
     // Connect search entry changed signal for query and debouncing
     let pending_search_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let pending_search_clone = pending_search_id.clone();
-    let list_store_clone = list_store.clone();
+    let list_store_clone3 = list_store.clone();
     let tracker_conn_clone = tracker_conn.clone();
 
     search_entry.connect_changed(move |entry| {
@@ -346,17 +436,17 @@ fn build_ui(app: &Application, tracker_conn: &Option<SparqlConnection>) -> (Appl
 
         let text = entry.text().to_string();
         if text.trim().is_empty() {
-            list_store_clone.remove_all();
+            list_store_clone3.remove_all();
             return;
         }
 
         let pending_search_clone2 = pending_search_clone.clone();
-        let list_store_clone2 = list_store_clone.clone();
+        let list_store_clone4 = list_store_clone3.clone();
         let tracker_conn_clone2 = tracker_conn_clone.clone();
 
         let source_id = glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
             pending_search_clone2.borrow_mut().take();
-            perform_search(&text, &list_store_clone2, &tracker_conn_clone2);
+            perform_search(&text, &list_store_clone4, &tracker_conn_clone2);
         });
 
         *pending_search_clone.borrow_mut() = Some(source_id);
@@ -393,10 +483,20 @@ fn perform_search(query: &str, list_store: &gio::ListStore, tracker_conn: &Optio
             let exec_lower = exec.to_lowercase();
 
             if name_lower.contains(&query_lower) || desc_lower.contains(&query_lower) || exec_lower.contains(&query_lower) {
-                // Just use a fallback icon for now, since icon extraction from gio::Icon is complex in Rust
-                let icon_name = "application-x-executable".to_string();
+                // Try to extract native system icon name from GIcon
+                let mut icon_name = "application-x-executable".to_string();
+                if let Some(icon) = app.icon() {
+                    if let Some(themed) = icon.downcast_ref::<gio::ThemedIcon>() {
+                        let names = themed.names();
+                        if !names.is_empty() {
+                            icon_name = names[0].to_string();
+                        }
+                    } else if let Some(gicon_str) = icon.to_string() {
+                        icon_name = gicon_str.to_string();
+                    }
+                }
 
-                results.push(SearchResult::new(&name, &format!("App: {}", exec), &icon_name));
+                results.push(SearchResult::new_app(&name, &format!("App: {}", exec), &icon_name, &app));
                 app_count += 1;
                 if app_count >= 15 {
                     break;
@@ -428,17 +528,17 @@ fn perform_search(query: &str, list_store: &gio::ListStore, tracker_conn: &Optio
                     let friendly_path = if url.starts_with("file://") {
                         url.replacen("file://", "", 1)
                     } else {
-                        url
+                        url.clone()
                     };
 
-                    results.push(SearchResult::new(&name, &friendly_path, "text-x-generic"));
+                    results.push(SearchResult::new_file(&name, &friendly_path, "text-x-generic", &url));
                 }
             }
         }
 
         // 3. Fallback if nothing found
         if results.is_empty() {
-            results.push(SearchResult::new(
+            results.push(SearchResult::new_mock(
                 "No results found",
                 &format!("No matches found for '{}'", query_text),
                 "dialog-information"
@@ -452,6 +552,25 @@ fn perform_search(query: &str, list_store: &gio::ListStore, tracker_conn: &Optio
     });
 }
 
+fn execute_action(result: &SearchResult, window: &ApplicationWindow, search_entry: &Entry) {
+    if let Some(ref app_info) = *result.imp().app_info.borrow() {
+        let context: Option<&gio::AppLaunchContext> = None;
+        if let Err(e) = app_info.launch(&[], context) {
+            eprintln!("Error launching application {}: {}", app_info.display_name(), e);
+        }
+    } else if let Some(ref file_uri) = *result.imp().file_uri.borrow() {
+        if let Err(e) = gio::AppInfo::launch_default_for_uri(file_uri, None::<&gio::AppLaunchContext>) {
+            eprintln!("Error opening file {}: {}", file_uri, e);
+        }
+    } else {
+        println!("Mock action triggered for: {}", result.title());
+    }
+
+    // Hide the spotlight window and clear text for the next trigger
+    window.hide();
+    search_entry.set_text("");
+}
+
 fn populate_mock_data(list_store: &gio::ListStore) {
     let items = vec![
         ("Terminal", "Launch terminal emulator", "utilities-terminal"),
@@ -460,7 +579,7 @@ fn populate_mock_data(list_store: &gio::ListStore) {
     ];
 
     for (title, subtitle, icon) in items {
-        let item = SearchResult::new(title, subtitle, icon);
+        let item = SearchResult::new_mock(title, subtitle, icon);
         list_store.append(&item);
     }
 }
@@ -472,9 +591,9 @@ mod tests {
     #[test]
     fn test_search_result_creation() {
         gtk::init().unwrap();
-        let result = SearchResult::new("Test Title", "Test Subtitle", "test-icon");
+        let result = SearchResult::new_mock("Test Title", "Test Subtitle", "test-icon");
         assert_eq!(result.title(), "Test Title");
         assert_eq!(result.subtitle(), "Test Subtitle");
-        assert_eq!(result.icon(), "test-icon");
+        assert_eq!(result.icon_name(), "test-icon");
     }
 }
